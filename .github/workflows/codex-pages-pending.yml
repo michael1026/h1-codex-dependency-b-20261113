@@ -1,0 +1,51 @@
+name: Codex Pages Pending Deployment Control
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+  pages: write
+  id-token: write
+jobs:
+  create-pending:
+    environment:
+      name: github-pages
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build controlled pending marker
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p site
+          printf '<!doctype html><p id="marker">CODEX_PAGES_PENDING_B_20261113_0534</p>\n' > site/index.html
+      - name: Upload controlled artifact
+        id: upload
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: site
+      - name: Create deployment and observe terminal state
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LOCAL_ARTIFACT_ID: ${{ steps.upload.outputs.artifact_id }}
+        run: |
+          set -euo pipefail
+          oidc_file=$(mktemp)
+          curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL" > "$oidc_file"
+          oidc_token=$(jq -r '.value' "$oidc_file")
+          payload=$(mktemp)
+          jq -n --argjson artifact_id "$LOCAL_ARTIFACT_ID" --arg pages_build_version "$GITHUB_SHA" --arg oidc_token "$oidc_token" '{artifact_id:$artifact_id,pages_build_version:$pages_build_version,oidc_token:$oidc_token}' > "$payload"
+          response=$(mktemp)
+          create_status=$(curl -sS -o "$response" -w '%{http_code}' -X POST -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' -H "Authorization: Bearer $GH_TOKEN" 'https://api.github.com/repos/michael1026/h1-codex-dependency-b-20261113/pages/deployments' --data-binary "@$payload")
+          echo "created_http=$create_status"
+          echo "created_id=$(jq -r '.id // "none"' "$response")"
+          for attempt in $(seq 1 15); do
+            sleep 1
+            status_response=$(mktemp)
+            status_http=$(curl -sS -o "$status_response" -w '%{http_code}' -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/michael1026/h1-codex-dependency-b-20261113/pages/deployments/$GITHUB_SHA")
+            deployment_status=$(jq -r '.status // "missing"' "$status_response")
+            echo "observe_attempt_${attempt}_http=$status_http status=$deployment_status"
+            if [ "$deployment_status" = 'succeed' ] || [ "$deployment_status" = 'deployment_cancelled' ] || [ "$deployment_status" = 'cancelled' ] || [ "$deployment_status" = 'deployment_failed' ]; then
+              break
+            fi
+          done
